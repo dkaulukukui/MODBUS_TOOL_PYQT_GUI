@@ -12,7 +12,7 @@ from PyQt5.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout,
                              QHBoxLayout, QLabel, QComboBox, QPushButton, 
                              QSpinBox, QTextEdit, QGroupBox, QGridLayout,
                              QLineEdit, QCheckBox, QMessageBox, QTabWidget,
-                             QRadioButton, QButtonGroup)
+                             QRadioButton, QButtonGroup, QFrame)
 from PyQt5.QtCore import Qt, QTimer, QThread, pyqtSignal
 from PyQt5.QtGui import QFont
 import struct
@@ -20,6 +20,32 @@ import time
 
 
 import time
+
+
+class CollapsibleBox(QWidget):
+    """A collapsible group box widget"""
+    def __init__(self, title="", parent=None):
+        super().__init__(parent)
+        
+        self.toggle_button = QCheckBox(title)
+        self.toggle_button.setStyleSheet("QCheckBox { font-weight: bold; }")
+        self.toggle_button.setChecked(True)
+        self.toggle_button.stateChanged.connect(self.on_toggle)
+        
+        self.content_area = QFrame()
+        self.content_area.setFrameShape(QFrame.StyledPanel)
+        
+        layout = QVBoxLayout(self)
+        layout.setSpacing(0)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.addWidget(self.toggle_button)
+        layout.addWidget(self.content_area)
+        
+    def on_toggle(self, state):
+        self.content_area.setVisible(state == Qt.Checked)
+    
+    def setContentLayout(self, layout):
+        self.content_area.setLayout(layout)
 
 
 class ModbusMonitorThread(QThread):
@@ -192,7 +218,7 @@ class ModbusRTUTool(QMainWindow):
                 self.disconnect_tcp()
         
     def create_port_config(self):
-        group = QGroupBox('Serial Port Configuration')
+        box = CollapsibleBox('Serial Port Configuration')
         layout = QGridLayout()
         
         # Port selection
@@ -247,11 +273,11 @@ class ModbusRTUTool(QMainWindow):
         info_label.setStyleSheet('color: #666; font-size: 9pt; font-style: italic;')
         layout.addWidget(info_label, 7, 0, 1, 3)
         
-        group.setLayout(layout)
-        return group
+        box.setContentLayout(layout)
+        return box
     
     def create_tcp_config(self):
-        group = QGroupBox('TCP/IP Configuration')
+        box = CollapsibleBox('TCP/IP Configuration')
         layout = QGridLayout()
         
         # IP Address
@@ -280,11 +306,11 @@ class ModbusRTUTool(QMainWindow):
         self.tcp_connect_button.clicked.connect(self.toggle_tcp_connection)
         layout.addWidget(self.tcp_connect_button, 3, 0, 1, 2)
         
-        group.setLayout(layout)
-        return group
+        box.setContentLayout(layout)
+        return box
     
     def create_function_config(self):
-        group = QGroupBox('Modbus Packet Configuration')
+        box = CollapsibleBox('Modbus Packet Configuration')
         layout = QGridLayout()
         
         # Slave ID
@@ -378,12 +404,38 @@ class ModbusRTUTool(QMainWindow):
         self.timeout.setValue(1000)
         layout.addWidget(self.timeout, 9, 1)
         
-        group.setLayout(layout)
-        return group
+        box.setContentLayout(layout)
+        return box
     
     def create_display_area(self):
         group = QGroupBox('Packet Log')
         layout = QVBoxLayout()
+        
+        # Monitor formatting options
+        format_layout = QHBoxLayout()
+        format_layout.addWidget(QLabel('Monitor Display Format:'))
+        
+        self.monitor_format_combo = QComboBox()
+        self.monitor_format_combo.addItems([
+            'Hex (default)',
+            'Hex + Decimal',
+            'Hex + ASCII',
+            'Decimal only',
+            'Binary'
+        ])
+        self.monitor_format_combo.setCurrentIndex(0)
+        format_layout.addWidget(self.monitor_format_combo)
+        
+        self.show_timestamps = QCheckBox('Show timestamps')
+        self.show_timestamps.setChecked(True)
+        format_layout.addWidget(self.show_timestamps)
+        
+        self.show_direction = QCheckBox('Show TX/RX labels')
+        self.show_direction.setChecked(True)
+        format_layout.addWidget(self.show_direction)
+        
+        format_layout.addStretch()
+        layout.addLayout(format_layout)
         
         self.log_display = QTextEdit()
         self.log_display.setReadOnly(True)
@@ -597,10 +649,11 @@ class ModbusRTUTool(QMainWindow):
         received_crc = packet[-2:]
         calculated_crc = self.calculate_crc(data)
         
-        hex_str = ' '.join(f'{b:02X}' for b in packet)
+        # Format packet data based on user selection
+        formatted_str = self.format_packet_data(packet)
         
         if received_crc == calculated_crc:
-            self.log_message(f'📡 {hex_str}')
+            self.log_message(f'📡 {formatted_str}')
             self.log_message('   ✓ CRC Valid')
             
             # Decode packet
@@ -612,7 +665,7 @@ class ModbusRTUTool(QMainWindow):
             # Try to identify if this is a request or response
             self.decode_monitor_packet(data)
         else:
-            self.log_message(f'📡 {hex_str}')
+            self.log_message(f'📡 {formatted_str}')
             self.log_message(f'   ✗ CRC Error - Expected: {calculated_crc.hex().upper()}, Got: {received_crc.hex().upper()}')
     
     def decode_monitor_packet(self, data):
@@ -853,6 +906,26 @@ class ModbusRTUTool(QMainWindow):
         else:
             self.addr_warning.setText('')
             self.addr_mode_combo.setStyleSheet('')
+    
+    def format_packet_data(self, packet):
+        """Format packet data based on user selection"""
+        format_mode = self.monitor_format_combo.currentIndex()
+        hex_str = ' '.join(f'{b:02X}' for b in packet)
+        
+        if format_mode == 0:  # Hex (default)
+            return hex_str
+        elif format_mode == 1:  # Hex + Decimal
+            dec_str = ' '.join(f'{b:3d}' for b in packet)
+            return f'{hex_str}\n       DEC: {dec_str}'
+        elif format_mode == 2:  # Hex + ASCII
+            ascii_str = ''.join(chr(b) if 32 <= b < 127 else '.' for b in packet)
+            return f'{hex_str}\n       ASCII: {ascii_str}'
+        elif format_mode == 3:  # Decimal only
+            return ' '.join(f'{b:3d}' for b in packet)
+        elif format_mode == 4:  # Binary
+            return ' '.join(f'{b:08b}' for b in packet)
+        
+        return hex_str  # Fallback
     
     def calculate_crc(self, data):
         """Calculate Modbus CRC16"""
@@ -1100,8 +1173,9 @@ class ModbusRTUTool(QMainWindow):
                 self.serial_port.write(full_packet)
                 
                 # Log sent packet
-                hex_str = ' '.join(f'{b:02X}' for b in full_packet)
-                self.log_message(f'TX (RTU): {hex_str}')
+                formatted_packet = self.format_packet_data(full_packet)
+                direction_label = 'TX (RTU): ' if self.show_direction.isChecked() else ''
+                self.log_message(f'{direction_label}{formatted_packet}')
                 
                 # Log address info
                 display_addr = self.start_addr.value()
@@ -1127,8 +1201,9 @@ class ModbusRTUTool(QMainWindow):
                 response = self.serial_port.read(256)
                 
                 if response:
-                    hex_str = ' '.join(f'{b:02X}' for b in response)
-                    self.log_message(f'RX (RTU): {hex_str}')
+                    formatted_response = self.format_packet_data(response)
+                    direction_label = 'RX (RTU): ' if self.show_direction.isChecked() else ''
+                    self.log_message(f'{direction_label}{formatted_response}')
                     
                     # Verify CRC
                     if len(response) >= 3:
@@ -1155,8 +1230,9 @@ class ModbusRTUTool(QMainWindow):
                 self.tcp_socket.sendall(full_packet)
                 
                 # Log sent packet
-                hex_str = ' '.join(f'{b:02X}' for b in full_packet)
-                self.log_message(f'TX (TCP): {hex_str}')
+                formatted_packet = self.format_packet_data(full_packet)
+                direction_label = 'TX (TCP): ' if self.show_direction.isChecked() else ''
+                self.log_message(f'{direction_label}{formatted_packet}')
                 self.log_message(f'  MBAP: TxID={struct.unpack(">H", mbap_header[0:2])[0]}, '
                                f'Proto=0, Len={struct.unpack(">H", mbap_header[4:6])[0]}, '
                                f'Unit={mbap_header[6]}')
@@ -1193,8 +1269,9 @@ class ModbusRTUTool(QMainWindow):
                     
                     if len(response_pdu) == pdu_length:
                         full_response = response_header + response_pdu
-                        hex_str = ' '.join(f'{b:02X}' for b in full_response)
-                        self.log_message(f'RX (TCP): {hex_str}')
+                        formatted_response = self.format_packet_data(full_response)
+                        direction_label = 'RX (TCP): ' if self.show_direction.isChecked() else ''
+                        self.log_message(f'{direction_label}{formatted_response}')
                         self.log_message(f'  MBAP: TxID={rx_transaction_id}, '
                                        f'Proto={rx_protocol_id}, Len={rx_length}, '
                                        f'Unit={rx_unit_id}')
@@ -1270,8 +1347,12 @@ class ModbusRTUTool(QMainWindow):
     def log_message(self, message):
         """Add a message to the log display"""
         from datetime import datetime
-        timestamp = datetime.now().strftime('%H:%M:%S.%f')[:-3]
-        self.log_display.append(f'[{timestamp}] {message}')
+        
+        if self.show_timestamps.isChecked():
+            timestamp = datetime.now().strftime('%H:%M:%S.%f')[:-3]
+            self.log_display.append(f'[{timestamp}] {message}')
+        else:
+            self.log_display.append(message)
     
     def clear_log(self):
         self.log_display.clear()
