@@ -58,61 +58,114 @@ class ModbusMonitorThread(QThread):
         self.baudrate = baudrate
         self.running = False
         
+    def calculate_packet_length(self, slave_id, func_code, initial_data):
+        """Calculate expected packet length based on Modbus structure"""
+        try:
+            # Exception responses are always 5 bytes: slave + func|0x80 + exception_code + crc(2)
+            if func_code & 0x80:
+                return 5
+            
+            # Standard function codes
+            if func_code in [0x01, 0x02, 0x03, 0x04, 0x05, 0x06]:
+                # Read/write single - always 8 bytes total
+                return 8
+                
+            elif func_code in [0x0F, 0x10]:  # 15, 16 - Write multiple
+                # Check if this is request or response
+                if len(initial_data) >= 7:
+                    # Could be request with byte count
+                    byte_count = initial_data[6]  # Position of byte count in request
+                    # Request: slave + func + addr(2) + qty(2) + byte_count + data + crc(2)
+                    return 7 + byte_count + 2
+                else:
+                    # Response: slave + func + addr(2) + qty(2) + crc(2) = 8 bytes
+                    return 8
+            
+            # For read responses (func 01-04), byte count is at position 2
+            if func_code in [0x01, 0x02, 0x03, 0x04]:
+                if len(initial_data) >= 3:
+                    byte_count = initial_data[2]
+                    # Response: slave + func + byte_count + data + crc(2)
+                    return 3 + byte_count + 2
+                    
+            # Extended function codes (0x43-0x50)
+            if 0x43 <= func_code <= 0x50:
+                # These have variable length, default to reading more
+                return None  # Use timeout fallback
+                
+            # Unknown function code - can't determine length
+            return None
+            
+        except:
+            return None
+    
     def run(self):
         self.running = True
-        buffer = bytearray()
-        last_byte_time = time.time()
         
-        # Calculate 3.5 character times at the current baudrate for packet gap detection
-        # Each character is 11 bits (1 start + 8 data + 1 parity + 1 stop)
-        char_time_ms = (11.0 / self.baudrate) * 1000  # milliseconds per character
-        packet_gap_ms = char_time_ms * 3.5
+        # Timeout for reading bytes
+        self.serial_port.timeout = 0.1  # 100ms timeout
         
-        # Use at least 20ms gap to be safe and handle timing variations
-        if packet_gap_ms < 20:
-            packet_gap_ms = 20
-        
-        # Add some margin for safety (50% extra)
-        packet_gap_ms = packet_gap_ms * 1.5
-            
-        self.serial_port.timeout = 0.05  # 50ms timeout for reading
-        
-        print(f"Monitor: Baudrate={self.baudrate}, Char time={char_time_ms:.2f}ms, Packet gap={packet_gap_ms:.2f}ms")
+        print(f"Monitor: Structure-based packet detection enabled")
         
         while self.running:
             try:
-                # Read available bytes
+                # Wait for data
                 if self.serial_port.in_waiting > 0:
-                    byte = self.serial_port.read(1)
-                    if byte:
-                        current_time = time.time()
-                        time_gap = (current_time - last_byte_time) * 1000  # ms
-                        
-                        # If gap is too large, previous packet is complete
-                        if buffer and time_gap > packet_gap_ms:
-                            # Process complete packet
-                            if len(buffer) >= 4:  # Minimum: slave + func + data + CRC(2)
-                                self.packet_received.emit(bytes(buffer), 'MONITOR')
-                            buffer = bytearray()
-                        
-                        buffer.extend(byte)
-                        last_byte_time = current_time
-                else:
-                    # No data available, check if buffer has a complete packet
-                    if buffer:
-                        current_time = time.time()
-                        time_gap = (current_time - last_byte_time) * 1000
-                        
-                        if time_gap > packet_gap_ms:
-                            if len(buffer) >= 4:
-                                self.packet_received.emit(bytes(buffer), 'MONITOR')
-                            buffer = bytearray()
+                    # Read slave ID
+                    slave_byte = self.serial_port.read(1)
+                    if not slave_byte:
+                        continue
                     
-                    # Small sleep to prevent CPU spinning
-                    time.sleep(0.005)  # 5ms
+                    # Read function code
+                    func_byte = self.serial_port.read(1)
+                    if not func_byte:
+                        continue
+                    
+                    slave_id = slave_byte[0]
+                    func_code = func_byte[0]
+                    
+                    # Start building packet
+                    packet = bytearray(slave_byte + func_byte)
+                    
+                    # Read initial bytes to determine packet type
+                    initial_bytes = self.serial_port.read(6)  # Read up to 6 more bytes
+                    packet.extend(initial_bytes)
+                    
+                    # Calculate expected length
+                    expected_length = self.calculate_packet_length(slave_id, func_code, packet)
+                    
+                    if expected_length:
+                        # Read remaining bytes
+                        bytes_to_read = expected_length - len(packet)
+                        if bytes_to_read > 0:
+                            remaining = self.serial_port.read(bytes_to_read)
+                            packet.extend(remaining)
+                        
+                        # Trim if we read too many
+                        packet = packet[:expected_length]
+                        
+                        # Emit packet if it looks valid (at least has CRC)
+                        if len(packet) >= 4:
+                            self.packet_received.emit(bytes(packet), 'MONITOR')
+                    else:
+                        # Unknown length - use timeout method
+                        # Keep reading until timeout
+                        while True:
+                            byte = self.serial_port.read(1)
+                            if not byte:
+                                break
+                            packet.extend(byte)
+                        
+                        if len(packet) >= 4:
+                            self.packet_received.emit(bytes(packet), 'MONITOR')
+                else:
+                    # No data available, sleep briefly
+                    time.sleep(0.01)  # 10ms
                     
             except Exception as e:
                 print(f"Monitor error: {e}")
+                import traceback
+                traceback.print_exc()
                 break
     
     def stop(self):
@@ -123,13 +176,19 @@ class ModbusMonitorThread(QThread):
 class ModbusRTUTool(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.serial_port = None
-        self.tcp_socket = None
-        self.mode = 'RTU'  # Default mode
-        self.transaction_id = 0  # For Modbus TCP
-        self.monitor_thread = None
-        self.monitor_active = False
-        self.init_ui()
+        try:
+            self.serial_port = None
+            self.tcp_socket = None
+            self.mode = 'RTU'  # Default mode
+            self.transaction_id = 0  # For Modbus TCP
+            self.monitor_thread = None
+            self.monitor_active = False
+            self.init_ui()
+        except Exception as e:
+            print(f"Error during initialization: {e}")
+            import traceback
+            traceback.print_exc()
+            raise
         
     def init_ui(self):
         self.setWindowTitle('Modbus RTU/TCP Packet Generator')
@@ -582,7 +641,7 @@ class ModbusRTUTool(QMainWindow):
             self.send_button.setEnabled(False)  # Disable sending while monitoring
             
             self.log_message('=== MONITOR MODE STARTED ===')
-            self.log_message(f'Baudrate: {baudrate}, Packet gap detection enabled')
+            self.log_message(f'Structure-based packet detection (handles back-to-back packets)')
             self.log_message('Listening for Modbus RTU traffic...')
             
         except Exception as e:
@@ -660,7 +719,7 @@ class ModbusRTUTool(QMainWindow):
             slave_id = data[0]
             func_code = data[1]
             
-            self.log_message(f'   Slave/Unit: {slave_id}, Function: {func_code:02X}')
+            self.log_message(f'   Slave/Unit: {slave_id}, Function: 0x{func_code:02X} ({func_code})')
             
             # Try to identify if this is a request or response
             self.decode_monitor_packet(data)
@@ -682,7 +741,7 @@ class ModbusRTUTool(QMainWindow):
         if func_code >= 0x43 and func_code <= 0x50:  # Extended function code range
             is_extended = True
             base_func_code = func_code - 0x40
-            self.log_message(f'   Extended Function Code Detected (0x{func_code:02X} = base 0x{base_func_code:02X} + 0x40)')
+            self.log_message(f'   Extended Function Code Detected (0x{func_code:02X}/{func_code} = base 0x{base_func_code:02X}/{base_func_code} + 0x40)')
         
         # Check if exception response
         if func_code & 0x80:
@@ -784,19 +843,57 @@ class ModbusRTUTool(QMainWindow):
                 self.log_message(f'   Address: {addr}, Value: {value} (0x{value:04X})')
         
         elif base_func_code in [15, 16]:  # Write multiple
-            # Detect request vs response by presence of byte count field and data
-            if len(data) > 6:
-                # Could be extended or standard request
-                if is_extended:  # Extended with function code offset
-                    addr = struct.unpack('>I', data[2:6])[0]
-                    qty = struct.unpack('>H', data[6:8])[0]
-                    byte_count = data[8] if len(data) > 8 else 0
+            # Distinguish between standard and extended addressing by packet length and structure
+            
+            # Standard FC16 format: [slave][func][addr(2)][qty(2)][byte_count(1)][data(2*qty)]
+            # Split FC16 format:    [slave][func][addr_h(2)][addr_l(2)][qty(2)][byte_count(1)][data(2*qty)]
+            # Extended FC16 format: [slave][func+0x40][addr(4)][qty(2)][byte_count(1)][data(2*qty)]
+            
+            if is_extended:  # Extended with function code offset (uses 32-bit address)
+                addr = struct.unpack('>I', data[2:6])[0]
+                qty = struct.unpack('>H', data[6:8])[0]
+                byte_count = data[8] if len(data) > 8 else 0
+                func_names = {15: 'Write Multiple Coils', 16: 'Write Multiple Registers'}
+                self.log_message(f'   Type: EXTENDED REQUEST - {func_names.get(base_func_code, "Unknown")}')
+                self.log_message(f'   Address: {addr} (32-bit), Quantity: {qty}')
+                
+                if base_func_code == 16 and byte_count > 0:  # Registers
+                    write_data = data[9:9+byte_count]
+                    registers = []
+                    for i in range(0, len(write_data), 2):
+                        if i+1 < len(write_data):
+                            reg = struct.unpack('>H', write_data[i:i+2])[0]
+                            registers.append(reg)
+                    self.log_message(f'   Values: {registers}')
+            elif len(data) > 6:  # Has data field (potential request)
+                # Try standard format first (most common)
+                addr_std = struct.unpack('>H', data[2:4])[0]
+                qty_std = struct.unpack('>H', data[4:6])[0]
+                byte_count_std = data[6] if len(data) > 6 else 0
+                
+                # Calculate expected length for standard format
+                # slave(1) + func(1) + addr(2) + qty(2) + byte_count(1) + data(byte_count)
+                expected_std_len = 7 + byte_count_std
+                
+                # Check if standard format makes sense
+                is_standard = False
+                if base_func_code == 16:  # Registers
+                    # For registers: byte_count should be qty * 2
+                    if byte_count_std == qty_std * 2 and len(data) >= expected_std_len:
+                        is_standard = True
+                elif base_func_code == 15:  # Coils
+                    # For coils: byte_count should be (qty + 7) / 8
+                    if byte_count_std == (qty_std + 7) // 8 and len(data) >= expected_std_len:
+                        is_standard = True
+                
+                if is_standard:
+                    # Standard format
                     func_names = {15: 'Write Multiple Coils', 16: 'Write Multiple Registers'}
-                    self.log_message(f'   Type: EXTENDED REQUEST - {func_names.get(base_func_code, "Unknown")}')
-                    self.log_message(f'   Address: {addr} (32-bit), Quantity: {qty}')
+                    self.log_message(f'   Type: REQUEST - {func_names.get(base_func_code, "Unknown")}')
+                    self.log_message(f'   Address: {addr_std}, Quantity: {qty_std}')
                     
-                    if base_func_code == 16 and byte_count > 0:  # Registers
-                        write_data = data[9:9+byte_count]
+                    if base_func_code == 16:
+                        write_data = data[7:7+byte_count_std]
                         registers = []
                         for i in range(0, len(write_data), 2):
                             if i+1 < len(write_data):
@@ -804,52 +901,43 @@ class ModbusRTUTool(QMainWindow):
                                 registers.append(reg)
                         self.log_message(f'   Values: {registers}')
                 else:
-                    # Check for split addressing or standard
-                    if len(data) > 8:
-                        # Try to parse - could be split or standard
-                        # Standard: [slave][func][addr][qty][byte_count][data...]
-                        # Split: [slave][func][addr_h][addr_l][qty][byte_count][data...]
-                        
-                        # Heuristic: if byte 7 looks like reasonable byte count, it's likely split
-                        potential_bc_split = data[6]
-                        potential_bc_std = data[6]
-                        
-                        # Try split first if we have enough data
+                    # Try split addressing (extended)
+                    if len(data) >= 9:  # Need at least addr_h + addr_l + qty + byte_count
                         addr_high = struct.unpack('>H', data[2:4])[0]
-                        if addr_high > 0 and len(data) > 8:  # Likely split
-                            addr_low = struct.unpack('>H', data[4:6])[0]
+                        addr_low = struct.unpack('>H', data[4:6])[0]
+                        qty_split = struct.unpack('>H', data[6:8])[0]
+                        byte_count_split = data[8] if len(data) > 8 else 0
+                        
+                        # Verify split format makes sense
+                        expected_split_len = 9 + byte_count_split
+                        is_split = False
+                        
+                        if base_func_code == 16:
+                            if byte_count_split == qty_split * 2 and len(data) >= expected_split_len:
+                                is_split = True
+                        elif base_func_code == 15:
+                            if byte_count_split == (qty_split + 7) // 8 and len(data) >= expected_split_len:
+                                is_split = True
+                        
+                        if is_split:
                             full_addr = (addr_high << 16) | addr_low
-                            qty = struct.unpack('>H', data[6:8])[0]
-                            byte_count = data[8] if len(data) > 8 else 0
                             func_names = {15: 'Write Multiple Coils', 16: 'Write Multiple Registers'}
                             self.log_message(f'   Type: EXTENDED REQUEST (Split) - {func_names.get(base_func_code, "Unknown")}')
-                            self.log_message(f'   Address: {full_addr}, Quantity: {qty}')
+                            self.log_message(f'   Address: {full_addr} (High: {addr_high}, Low: {addr_low}), Quantity: {qty_split}')
                             
-                            if base_func_code == 16 and byte_count > 0:
-                                write_data = data[9:9+byte_count]
+                            if base_func_code == 16 and byte_count_split > 0:
+                                write_data = data[9:9+byte_count_split]
                                 registers = []
                                 for i in range(0, len(write_data), 2):
                                     if i+1 < len(write_data):
                                         reg = struct.unpack('>H', write_data[i:i+2])[0]
                                         registers.append(reg)
                                 self.log_message(f'   Values: {registers}')
-                        else:  # Standard
-                            addr = struct.unpack('>H', data[2:4])[0]
-                            qty = struct.unpack('>H', data[4:6])[0]
-                            byte_count = data[6]
-                            func_names = {15: 'Write Multiple Coils', 16: 'Write Multiple Registers'}
-                            self.log_message(f'   Type: REQUEST - {func_names.get(base_func_code, "Unknown")}')
-                            self.log_message(f'   Address: {addr}, Quantity: {qty}')
-                            
-                            if base_func_code == 16:
-                                write_data = data[7:7+byte_count]
-                                registers = []
-                                for i in range(0, len(write_data), 2):
-                                    if i+1 < len(write_data):
-                                        reg = struct.unpack('>H', write_data[i:i+2])[0]
-                                        registers.append(reg)
-                                self.log_message(f'   Values: {registers}')
-            elif len(data) == 6:  # Response
+                        else:
+                            # Can't determine format reliably
+                            self.log_message(f'   Type: Write Multiple (format unclear)')
+                            self.log_message(f'   Raw data: {" ".join(f"{b:02X}" for b in data[2:])}')
+            elif len(data) == 6:  # Response format
                 addr = struct.unpack('>H', data[2:4])[0]
                 qty = struct.unpack('>H', data[4:6])[0]
                 func_names = {15: 'Write Multiple Coils', 16: 'Write Multiple Registers'}
@@ -859,12 +947,18 @@ class ModbusRTUTool(QMainWindow):
                 addr_high = struct.unpack('>H', data[2:4])[0]
                 addr_low = struct.unpack('>H', data[4:6])[0]
                 qty = struct.unpack('>H', data[6:8])[0]
-                full_addr = (addr_high << 16) | addr_low
-                func_names = {15: 'Write Multiple Coils', 16: 'Write Multiple Registers'}
-                self.log_message(f'   Type: EXTENDED RESPONSE (Split) - {func_names.get(base_func_code, "Unknown")}')
-                self.log_message(f'   Address: {full_addr}, Quantity: {qty}')
+                
+                # Only interpret as split if high address is significant
+                if addr_high > 0:
+                    full_addr = (addr_high << 16) | addr_low
+                    func_names = {15: 'Write Multiple Coils', 16: 'Write Multiple Registers'}
+                    self.log_message(f'   Type: EXTENDED RESPONSE (Split) - {func_names.get(base_func_code, "Unknown")}')
+                    self.log_message(f'   Address: {full_addr}, Quantity: {qty}')
+                else:
+                    # Probably malformed or unknown format
+                    self.log_message(f'   Type: Response (unusual length)')
         else:
-            self.log_message(f'   Type: Unknown function code {func_code}')
+            self.log_message(f'   Type: Unknown function code 0x{func_code:02X} ({func_code})')
     
     def update_function_fields(self):
         func_text = self.function_combo.currentText()
@@ -1374,10 +1468,28 @@ class ModbusRTUTool(QMainWindow):
 
 
 def main():
-    app = QApplication(sys.argv)
-    window = ModbusRTUTool()
-    window.show()
-    sys.exit(app.exec_())
+    try:
+        app = QApplication(sys.argv)
+        window = ModbusRTUTool()
+        window.show()
+        sys.exit(app.exec_())
+    except Exception as e:
+        print("=" * 60)
+        print("FATAL ERROR - Program failed to start")
+        print("=" * 60)
+        print(f"\nError: {type(e).__name__}")
+        print(f"Message: {str(e)}")
+        print("\nFull traceback:")
+        import traceback
+        traceback.print_exc()
+        print("\n" + "=" * 60)
+        print("Troubleshooting:")
+        print("1. Run test_dependencies.py to check all requirements")
+        print("2. Ensure PyQt5 is installed: pip install pyqt5")
+        print("3. Ensure pyserial is installed: pip install pyserial")
+        print("=" * 60)
+        input("\nPress Enter to exit...")
+        sys.exit(1)
 
 
 if __name__ == '__main__':
