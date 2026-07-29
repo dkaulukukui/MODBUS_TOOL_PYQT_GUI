@@ -37,6 +37,8 @@ MODBUS_TOOL is a comprehensive packet generator and monitoring application desig
 - **Packet Log**: Real-time display of transmitted and received packets
 - **CRC Calculation**: Automatic CRC-16 calculation for RTU packets, with an opt-out for custom packets
 - **Payload Byte Order**: MSB-first (standard) or LSB-first (byte-swapped) 16-bit register data
+- **Data Value Formats**: Decode returned register data as 8/16/32-bit integers (signed or unsigned),
+  32/64-bit IEEE 754 floats, or ASCII text, with selectable word order for multi-register values
 - **Flexible Input**: Support for decimal and hexadecimal value input
 - **TCP Transaction Management**: Automatic transaction ID handling for Modbus TCP
 - **Timeout Configuration**: Adjustable response timeout (100-5000ms)
@@ -126,6 +128,18 @@ chmod +x modbus_tool.py
   exactly as typed, including your own (or deliberately bad) CRC bytes.
 - **Timeout**: Response timeout in milliseconds
 
+### Packet Log Display Options
+- **Monitor Display Format**: Numeric base used for raw packet bytes and decoded values
+  (Hex, Hex + Decimal, Hex + ASCII, Hex + Binary, Decimal only, Binary only)
+- **Data Value Format**: How returned register data segments are interpreted — 16-bit unsigned
+  (default), 16-bit signed, 8-bit unsigned/signed, 32-bit unsigned/signed (2 registers),
+  32-bit float (2 registers), 64-bit float (4 registers), or ASCII string. Applies to read
+  responses and to the values inside Write Multiple Registers packets.
+- **Word Order**: Register order inside 32/64-bit values — high word first (big-endian) or low
+  word first (word-swapped). Combined with Payload Byte Order this covers all four common
+  32-bit layouts (ABCD, BADC, CDAB, DCBA).
+- **Show timestamps** / **Show TX/RX labels**: Log line decorations
+
 ## Examples
 
 ### Reading Holding Registers
@@ -133,6 +147,12 @@ chmod +x modbus_tool.py
 - Function Code: 03 - Read Holding Registers
 - Start Address: 0
 - Quantity: 10
+
+### Reading a 32-bit Float Pair
+- Function Code: 03 - Read Holding Registers
+- Quantity: 2
+- Data Value Format: 32-bit float (2 registers)
+- Word Order: try "High word first" first; switch to "Low word first" if the value looks wrong
 
 ### Writing Multiple Registers
 - Slave ID: 1

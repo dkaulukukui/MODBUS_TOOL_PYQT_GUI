@@ -25,6 +25,21 @@ import time
 __version__ = '1.0'
 
 
+# How register data segments are interpreted for display: (menu label, key).
+# Order matters - data_format_combo is indexed into this list.
+DATA_FORMATS = [
+    ('16-bit unsigned', 'u16'),
+    ('16-bit signed', 's16'),
+    ('8-bit unsigned', 'u8'),
+    ('8-bit signed', 's8'),
+    ('32-bit unsigned (2 registers)', 'u32'),
+    ('32-bit signed (2 registers)', 's32'),
+    ('32-bit float (2 registers)', 'f32'),
+    ('64-bit float (4 registers)', 'f64'),
+    ('ASCII string', 'ascii'),
+]
+
+
 def calculate_crc16(data):
     """Calculate Modbus CRC16 and return it as 2 little-endian bytes"""
     crc = 0xFFFF
@@ -556,7 +571,31 @@ class ModbusRTUTool(QMainWindow):
         
         format_layout.addStretch()
         layout.addLayout(format_layout)
-        
+
+        # Interpretation of returned register data segments
+        data_layout = QHBoxLayout()
+        data_layout.addWidget(QLabel('Data Value Format:'))
+
+        self.data_format_combo = QComboBox()
+        self.data_format_combo.addItems([label for label, _ in DATA_FORMATS])
+        self.data_format_combo.setCurrentIndex(0)
+        self.data_format_combo.setToolTip('How register data segments (read responses and '
+                                          'written values) are decoded for display')
+        data_layout.addWidget(self.data_format_combo)
+
+        data_layout.addWidget(QLabel('Word Order:'))
+        self.word_order_combo = QComboBox()
+        self.word_order_combo.addItems([
+            'High word first (Big-endian)',
+            'Low word first (Word-swapped)'
+        ])
+        self.word_order_combo.setCurrentIndex(0)
+        self.word_order_combo.setToolTip('Register order within 32/64-bit values')
+        data_layout.addWidget(self.word_order_combo)
+
+        data_layout.addStretch()
+        layout.addLayout(data_layout)
+
         self.log_display = QTextEdit()
         self.log_display.setReadOnly(True)
         self.log_display.setFont(QFont('Courier', 9))
@@ -899,8 +938,7 @@ class ModbusRTUTool(QMainWindow):
                         formatted_bits = self.format_decoded_values(bits[:byte_count*8], 'coil')
                         self.log_message(f'   Values: {formatted_bits}')
                     elif base_func_code in [3, 4]:  # Registers
-                        registers = self.unpack_words(response_data[:byte_count])
-                        formatted_regs = self.format_decoded_values(registers, 'register')
+                        formatted_regs = self.format_data_values(response_data[:byte_count])
                         self.log_message(f'   Registers: {formatted_regs}')
         
         elif base_func_code in [5, 6]:  # Write single
@@ -953,8 +991,7 @@ class ModbusRTUTool(QMainWindow):
                 
                 if base_func_code == 16 and byte_count > 0:  # Registers
                     write_data = data[9:9+byte_count]
-                    registers = self.unpack_words(write_data)
-                    formatted_regs = self.format_decoded_values(registers, 'register')
+                    formatted_regs = self.format_data_values(write_data)
                     self.log_message(f'   Values: {formatted_regs}')
             elif len(data) > 6:  # Has data field (potential request)
                 # Try standard format first (most common)
@@ -985,8 +1022,7 @@ class ModbusRTUTool(QMainWindow):
                     
                     if base_func_code == 16:
                         write_data = data[7:7+byte_count_std]
-                        registers = self.unpack_words(write_data)
-                        formatted_regs = self.format_decoded_values(registers, 'register')
+                        formatted_regs = self.format_data_values(write_data)
                         self.log_message(f'   Values: {formatted_regs}')
                 else:
                     # Try split addressing (extended)
@@ -1015,8 +1051,7 @@ class ModbusRTUTool(QMainWindow):
                             
                             if base_func_code == 16 and byte_count_split > 0:
                                 write_data = data[9:9+byte_count_split]
-                                registers = self.unpack_words(write_data)
-                                formatted_regs = self.format_decoded_values(registers, 'register')
+                                formatted_regs = self.format_data_values(write_data)
                                 self.log_message(f'   Values: {formatted_regs}')
                         else:
                             # Can't determine format reliably
@@ -1191,63 +1226,117 @@ class ModbusRTUTool(QMainWindow):
         
         return packets
     
-    def format_decoded_values(self, values, value_type='register'):
-        """Format decoded register/coil values based on user selection
-        
-        Args:
-            values: List of integer values (registers or coils)
-            value_type: 'register' for 16-bit values, 'coil' for boolean values
+    def format_decoded_values(self, values, value_type='coil'):
+        """Format decoded coil/discrete input values
+
+        Register data goes through format_data_values() instead, which honours
+        the selected data type. Coils are single bits, so the numeric base
+        options do not apply to them.
         """
+        return str(values)
+
+    def data_format(self):
+        """Selected interpretation for register data segments (see DATA_FORMATS)"""
+        return DATA_FORMATS[self.data_format_combo.currentIndex()][1]
+
+    def regroup_bytes(self, chunk):
+        """Reorder a multi-register chunk into big-endian order for unpacking
+
+        Applies the payload byte order within each 16-bit word and the word
+        order across words, so all four common 32-bit layouts (ABCD, BADC,
+        CDAB, DCBA) are reachable.
+        """
+        words = [chunk[i:i+2] for i in range(0, len(chunk), 2)]
+        if self.byte_order_combo.currentIndex() == 1:  # LSB first within a word
+            words = [bytes(reversed(w)) for w in words]
+        if self.word_order_combo.currentIndex() == 1:  # low word first
+            words = list(reversed(words))
+        return b''.join(words)
+
+    def decode_data_values(self, data):
+        """Interpret payload bytes using the selected data format
+
+        Returns (values, kind, bits) where kind is 'int', 'float' or 'ascii'
+        and bits is the width of a single value.
+        """
+        fmt = self.data_format()
+
+        if fmt in ('u8', 's8'):
+            values = list(data)
+            if fmt == 's8':
+                values = [v - 0x100 if v > 0x7F else v for v in values]
+            return values, 'int', 8
+
+        if fmt in ('u16', 's16'):
+            values = self.unpack_words(data)
+            if fmt == 's16':
+                values = [v - 0x10000 if v > 0x7FFF else v for v in values]
+            return values, 'int', 16
+
+        if fmt == 'ascii':
+            text = ''.join(chr(b) if 32 <= b < 127 else '.' for b in data)
+            return [text], 'ascii', 8
+
+        # Multi-register types: 32-bit ints/floats and 64-bit floats
+        struct_codes = {'u32': ('>I', 4, 'int'), 's32': ('>i', 4, 'int'),
+                        'f32': ('>f', 4, 'float'), 'f64': ('>d', 8, 'float')}
+        code, width, kind = struct_codes[fmt]
+
+        values = []
+        for i in range(0, len(data) - width + 1, width):
+            values.append(struct.unpack(code, self.regroup_bytes(data[i:i+width]))[0])
+        return values, kind, width * 8
+
+    def format_data_values(self, data):
+        """Format a register data segment using the selected data type and base
+
+        Args:
+            data: Raw payload bytes of the data segment (no headers, no CRC)
+        """
+        values, kind, bits = self.decode_data_values(data)
         format_mode = self.monitor_format_combo.currentIndex()
-        
+        label, fmt = DATA_FORMATS[self.data_format_combo.currentIndex()]
+
+        if kind == 'ascii':
+            return f'({label}) "{values[0]}"' if values else '(none)'
+
+        if kind == 'float':
+            shown = [f'{v:.6g}' for v in values]
+            head = f'({label}) [{", ".join(shown)}]'
+            if format_mode == 4:  # Decimal only
+                return head
+            # Show the raw IEEE-754 bytes alongside the decoded value
+            raw = [f'0x{struct.unpack(">Q" if bits == 64 else ">I", self.regroup_bytes(data[i:i+bits//8]))[0]:0{bits//4}X}'
+                   for i in range(0, len(data) - bits//8 + 1, bits//8)]
+            return f'{head}\n       Raw: {raw}'
+
+        # Integers - hex/binary use the two's complement representation
+        mask = (1 << bits) - 1
+        hex_vals = [f'0x{v & mask:0{bits // 4}X}' for v in values]
+        bin_vals = [f'{v & mask:0{bits}b}' for v in values]
+        head = f'{values}' if fmt == 'u16' else f'({label}) {values}'
+
         if format_mode == 0:  # Hex (default) - show both decimal and hex
-            if value_type == 'register':
-                return f'{values}\n       Hex: {[f"0x{v:04X}" for v in values]}'
-            else:  # coils
-                return str(values)
-        
-        elif format_mode == 1:  # Hex + Decimal - show all three
-            if value_type == 'register':
-                hex_vals = [f"0x{v:04X}" for v in values]
-                return f'Dec: {values}\n       Hex: {hex_vals}'
-            else:
-                return str(values)
-        
+            return f'{head}\n       Hex: {hex_vals}'
+
+        elif format_mode == 1:  # Hex + Decimal
+            return f'Dec: {head}\n       Hex: {hex_vals}'
+
         elif format_mode == 2:  # Hex + ASCII - show hex and ASCII interpretation
-            if value_type == 'register':
-                hex_vals = [f"0x{v:04X}" for v in values]
-                # Convert 16-bit values to ASCII (high byte, low byte)
-                ascii_chars = []
-                for v in values:
-                    high = (v >> 8) & 0xFF
-                    low = v & 0xFF
-                    high_char = chr(high) if 32 <= high < 127 else '.'
-                    low_char = chr(low) if 32 <= low < 127 else '.'
-                    ascii_chars.append(f'{high_char}{low_char}')
-                return f'{values}\n       Hex: {hex_vals}\n       ASCII: {"".join(ascii_chars)}'
-            else:
-                return str(values)
-        
+            ascii_str = ''.join(chr(b) if 32 <= b < 127 else '.' for b in data)
+            return f'{head}\n       Hex: {hex_vals}\n       ASCII: {ascii_str}'
+
         elif format_mode == 3:  # Hex + Binary
-            if value_type == 'register':
-                hex_vals = [f"0x{v:04X}" for v in values]
-                bin_vals = [f'{v:016b}' for v in values]
-                return f'{values}\n       Hex: {hex_vals}\n       Bin: {bin_vals}'
-            else:
-                return str(values)
-        
+            return f'{head}\n       Hex: {hex_vals}\n       Bin: {bin_vals}'
+
         elif format_mode == 4:  # Decimal only
-            return str(values)
-        
+            return head
+
         elif format_mode == 5:  # Binary only
-            if value_type == 'register':
-                bin_vals = [f'{v:016b}' for v in values]
-                return f'{values}\n       Bin: {bin_vals}'
-            else:
-                return str(values)
-        
-        return str(values)  # Fallback
-    
+            return f'{head}\n       Bin: {bin_vals}'
+
+        return head  # Fallback
+
     def calculate_crc(self, data):
         """Calculate Modbus CRC16"""
         return calculate_crc16(data)
@@ -1700,9 +1789,7 @@ class ModbusRTUTool(QMainWindow):
         elif func in [3, 4]:  # Read holding/input registers
             byte_count = pdu[1]
             data = pdu[2:2+byte_count]
-            registers = self.unpack_words(data)
-            formatted_regs = self.format_decoded_values(registers, 'register')
-            self.log_message(f'  Registers: {formatted_regs}')
+            self.log_message(f'  Registers: {self.format_data_values(data)}')
             
         elif func in [5, 6, 15, 16]:  # Write confirmation
             addr = struct.unpack('>H', pdu[1:3])[0]

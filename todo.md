@@ -13,3 +13,6 @@ Completed in v1.0:
   data on send and decode only (addresses, quantities and byte counts stay big-endian per spec)
 - allow user to disable automatic CRC calcs for custom function payload — "Auto-calculate CRC for
   custom packet" checkbox (RTU); when unchecked the custom packet is sent exactly as typed
+- selectable display formats for returned data segments — "Data Value Format" (8/16/32-bit signed
+  and unsigned ints, 32/64-bit IEEE 754 floats, ASCII) plus a "Word Order" selector for
+  multi-register values, both in the Packet Log options row
