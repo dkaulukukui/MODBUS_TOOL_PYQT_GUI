@@ -1,5 +1,7 @@
 # MODBUS_TOOL
 
+Version 1.0
+
 A Python PyQt5 GUI tool for Modbus RTU and TCP troubleshooting, testing, and monitoring.
 
 ## Description
@@ -33,7 +35,8 @@ MODBUS_TOOL is a comprehensive packet generator and monitoring application desig
 ### Advanced Features
 - **Monitor Mode**: Passively listen to all Modbus RTU traffic on the serial line
 - **Packet Log**: Real-time display of transmitted and received packets
-- **CRC Calculation**: Automatic CRC-16 calculation for RTU packets
+- **CRC Calculation**: Automatic CRC-16 calculation for RTU packets, with an opt-out for custom packets
+- **Payload Byte Order**: MSB-first (standard) or LSB-first (byte-swapped) 16-bit register data
 - **Flexible Input**: Support for decimal and hexadecimal value input
 - **TCP Transaction Management**: Automatic transaction ID handling for Modbus TCP
 - **Timeout Configuration**: Adjustable response timeout (100-5000ms)
@@ -115,7 +118,12 @@ chmod +x modbus_tool.py
 - **Start Address**: Register or coil starting address (0-65535)
 - **Quantity**: Number of registers/coils to read
 - **Write Values**: Values to write (for write functions)
+- **Payload Byte Order**: Byte order of 16-bit register data only. `MSB first` is the Modbus
+  standard; `LSB first` byte-swaps each register value on send and on decode, for devices that
+  publish little-endian words. Addresses, quantities and byte counts are always big-endian.
 - **Custom Packet**: Manual hex packet entry (without CRC)
+- **Auto-calculate CRC for custom packet**: On by default. Uncheck to send a custom RTU packet
+  exactly as typed, including your own (or deliberately bad) CRC bytes.
 - **Timeout**: Response timeout in milliseconds
 
 ## Examples

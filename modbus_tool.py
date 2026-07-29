@@ -22,6 +22,29 @@ import time
 import time
 
 
+__version__ = '1.0'
+
+
+def calculate_crc16(data):
+    """Calculate Modbus CRC16 and return it as 2 little-endian bytes"""
+    crc = 0xFFFF
+    for byte in data:
+        crc ^= byte
+        for _ in range(8):
+            if crc & 0x0001:
+                crc = (crc >> 1) ^ 0xA001
+            else:
+                crc >>= 1
+    return struct.pack('<H', crc)  # Little-endian
+
+
+def crc_is_valid(packet):
+    """True if the last 2 bytes of packet are a valid CRC over the rest"""
+    if len(packet) < 4:
+        return False
+    return bytes(packet[-2:]) == calculate_crc16(packet[:-2])
+
+
 class CollapsibleBox(QWidget):
     """A collapsible group box widget"""
     def __init__(self, title="", parent=None):
@@ -59,43 +82,51 @@ class ModbusMonitorThread(QThread):
         self.running = False
         
     def calculate_packet_length(self, slave_id, func_code, initial_data):
-        """Calculate expected packet length based on Modbus structure"""
+        """Calculate expected packet length based on Modbus structure
+
+        initial_data holds the bytes already read (up to 8). Requests and
+        responses share a function code but not a layout, so the 8-byte
+        fixed-size interpretation is confirmed with a CRC check before
+        falling back to the variable-length (byte count) interpretation.
+        """
         try:
             # Exception responses are always 5 bytes: slave + func|0x80 + exception_code + crc(2)
             if func_code & 0x80:
                 return 5
-            
-            # Standard function codes
-            if func_code in [0x01, 0x02, 0x03, 0x04, 0x05, 0x06]:
-                # Read/write single - always 8 bytes total
+
+            # Write single coil/register: request and response are both 8 bytes
+            if func_code in [0x05, 0x06]:
                 return 8
-                
-            elif func_code in [0x0F, 0x10]:  # 15, 16 - Write multiple
-                # Check if this is request or response
-                if len(initial_data) >= 7:
-                    # Could be request with byte count
-                    byte_count = initial_data[6]  # Position of byte count in request
-                    # Request: slave + func + addr(2) + qty(2) + byte_count + data + crc(2)
-                    return 7 + byte_count + 2
-                else:
-                    # Response: slave + func + addr(2) + qty(2) + crc(2) = 8 bytes
-                    return 8
-            
-            # For read responses (func 01-04), byte count is at position 2
+
             if func_code in [0x01, 0x02, 0x03, 0x04]:
+                # Request is 8 bytes: slave + func + addr(2) + qty(2) + crc(2)
+                if crc_is_valid(initial_data[:8]):
+                    return 8
+                # Otherwise it is a response: slave + func + byte_count + data + crc(2)
                 if len(initial_data) >= 3:
                     byte_count = initial_data[2]
-                    # Response: slave + func + byte_count + data + crc(2)
                     return 3 + byte_count + 2
-                    
+                return None
+
+            if func_code in [0x0F, 0x10]:  # 15, 16 - Write multiple
+                # Response is 8 bytes: slave + func + addr(2) + qty(2) + crc(2)
+                if crc_is_valid(initial_data[:8]):
+                    return 8
+                # Otherwise it is a request, whose byte count sits at index 6:
+                # slave + func + addr(2) + qty(2) + byte_count + data + crc(2)
+                if len(initial_data) >= 7:
+                    byte_count = initial_data[6]
+                    return 7 + byte_count + 2
+                return None
+
             # Extended function codes (0x43-0x50)
             if 0x43 <= func_code <= 0x50:
                 # These have variable length, default to reading more
                 return None  # Use timeout fallback
-                
+
             # Unknown function code - can't determine length
             return None
-            
+
         except:
             return None
     
@@ -106,44 +137,43 @@ class ModbusMonitorThread(QThread):
         self.serial_port.timeout = 0.1  # 100ms timeout
         
         print(f"Monitor: Structure-based packet detection enabled")
-        
+
+        # Bytes read past the end of a packet, carried into the next iteration
+        # instead of being discarded (they belong to the following packet)
+        leftover = bytearray()
+
         while self.running:
             try:
                 # Wait for data
-                if self.serial_port.in_waiting > 0:
-                    # Read slave ID
-                    slave_byte = self.serial_port.read(1)
-                    if not slave_byte:
+                if leftover or self.serial_port.in_waiting > 0:
+                    packet = bytearray(leftover)
+                    leftover = bytearray()
+
+                    # Read enough of the header to classify the packet (8 bytes
+                    # covers every fixed-size frame and both byte count fields)
+                    if len(packet) < 8:
+                        packet.extend(self.serial_port.read(8 - len(packet)))
+
+                    if len(packet) < 2:
                         continue
-                    
-                    # Read function code
-                    func_byte = self.serial_port.read(1)
-                    if not func_byte:
-                        continue
-                    
-                    slave_id = slave_byte[0]
-                    func_code = func_byte[0]
-                    
-                    # Start building packet
-                    packet = bytearray(slave_byte + func_byte)
-                    
-                    # Read initial bytes to determine packet type
-                    initial_bytes = self.serial_port.read(6)  # Read up to 6 more bytes
-                    packet.extend(initial_bytes)
-                    
+
+                    slave_id = packet[0]
+                    func_code = packet[1]
+
                     # Calculate expected length
                     expected_length = self.calculate_packet_length(slave_id, func_code, packet)
-                    
+
                     if expected_length:
                         # Read remaining bytes
                         bytes_to_read = expected_length - len(packet)
                         if bytes_to_read > 0:
                             remaining = self.serial_port.read(bytes_to_read)
                             packet.extend(remaining)
-                        
-                        # Trim if we read too many
+
+                        # Keep anything belonging to the next packet
+                        leftover = packet[expected_length:]
                         packet = packet[:expected_length]
-                        
+
                         # Emit packet if it looks valid (at least has CRC)
                         if len(packet) >= 4:
                             self.packet_received.emit(bytes(packet), 'MONITOR')
@@ -191,7 +221,7 @@ class ModbusRTUTool(QMainWindow):
             raise
         
     def init_ui(self):
-        self.setWindowTitle('Modbus RTU/TCP Packet Generator')
+        self.setWindowTitle(f'Modbus RTU/TCP Packet Generator v{__version__}')
         self.setGeometry(100, 100, 900, 750)
         
         # Main widget and layout
@@ -233,9 +263,11 @@ class ModbusRTUTool(QMainWindow):
         send_layout.addWidget(self.clear_button)
         
         layout.addLayout(send_layout)
-        
+
         # Refresh port list on startup
         self.refresh_ports()
+
+        self.log_message(f'Modbus RTU/TCP Packet Generator v{__version__}')
     
     def create_mode_selector(self):
         group = QGroupBox('Protocol Mode')
@@ -253,9 +285,13 @@ class ModbusRTUTool(QMainWindow):
         self.tcp_radio.toggled.connect(self.on_mode_changed)
         self.mode_button_group.addButton(self.tcp_radio)
         layout.addWidget(self.tcp_radio)
-        
+
         layout.addStretch()
-        
+
+        version_label = QLabel(f'v{__version__}')
+        version_label.setStyleSheet('color: #666; font-size: 9pt;')
+        layout.addWidget(version_label)
+
         group.setLayout(layout)
         return group
     
@@ -448,20 +484,44 @@ class ModbusRTUTool(QMainWindow):
         info_label = QLabel('Extended modes required for 6-digit addresses (>65535)')
         info_label.setStyleSheet('color: #666; font-size: 8pt; font-style: italic;')
         layout.addWidget(info_label, 7, 0, 1, 3)
-        
+
+        # Payload byte order (register data words only)
+        layout.addWidget(QLabel('Payload Byte Order:'), 8, 0)
+        self.byte_order_combo = QComboBox()
+        self.byte_order_combo.addItems([
+            'MSB first (Big-endian, standard)',
+            'LSB first (Little-endian, byte-swapped)'
+        ])
+        self.byte_order_combo.setCurrentIndex(0)
+        layout.addWidget(self.byte_order_combo, 8, 1, 1, 2)
+
+        byte_order_info = QLabel('Applies to 16-bit register data only; addresses, quantities '
+                                 'and byte counts stay big-endian per spec')
+        byte_order_info.setStyleSheet('color: #666; font-size: 8pt; font-style: italic;')
+        byte_order_info.setWordWrap(True)
+        layout.addWidget(byte_order_info, 9, 0, 1, 3)
+
         # Custom packet entry
-        layout.addWidget(QLabel('Custom Packet (hex):'), 8, 0)
+        layout.addWidget(QLabel('Custom Packet (hex):'), 10, 0)
         self.custom_packet = QLineEdit()
         self.custom_packet.setPlaceholderText('e.g., 01 03 00 00 00 0A (without CRC)')
         self.custom_packet.setEnabled(False)
-        layout.addWidget(self.custom_packet, 8, 1, 1, 2)
-        
+        layout.addWidget(self.custom_packet, 10, 1, 1, 2)
+
+        # Automatic CRC for custom packets (RTU only)
+        self.auto_crc_check = QCheckBox('Auto-calculate CRC for custom packet')
+        self.auto_crc_check.setChecked(True)
+        self.auto_crc_check.setEnabled(False)
+        self.auto_crc_check.setToolTip('Uncheck to send the custom packet exactly as typed, '
+                                       'including your own CRC bytes')
+        layout.addWidget(self.auto_crc_check, 11, 1, 1, 2)
+
         # Timeout
-        layout.addWidget(QLabel('Timeout (ms):'), 9, 0)
+        layout.addWidget(QLabel('Timeout (ms):'), 12, 0)
         self.timeout = QSpinBox()
         self.timeout.setRange(100, 5000)
         self.timeout.setValue(1000)
-        layout.addWidget(self.timeout, 9, 1)
+        layout.addWidget(self.timeout, 12, 1)
         
         box.setContentLayout(layout)
         return box
@@ -839,11 +899,7 @@ class ModbusRTUTool(QMainWindow):
                         formatted_bits = self.format_decoded_values(bits[:byte_count*8], 'coil')
                         self.log_message(f'   Values: {formatted_bits}')
                     elif base_func_code in [3, 4]:  # Registers
-                        registers = []
-                        for i in range(0, min(byte_count, len(response_data)), 2):
-                            if i+1 < len(response_data):
-                                reg = struct.unpack('>H', response_data[i:i+2])[0]
-                                registers.append(reg)
+                        registers = self.unpack_words(response_data[:byte_count])
                         formatted_regs = self.format_decoded_values(registers, 'register')
                         self.log_message(f'   Registers: {formatted_regs}')
         
@@ -852,6 +908,8 @@ class ModbusRTUTool(QMainWindow):
             if is_extended and len(data) >= 8:  # Extended with 32-bit address
                 addr = struct.unpack('>I', data[2:6])[0]
                 value = struct.unpack('>H', data[6:8])[0]
+                if base_func_code == 6:  # Register value is payload data
+                    value = self.swap_if_lsb(value)
                 func_names = {5: 'Write Single Coil', 6: 'Write Single Register'}
                 self.log_message(f'   Type: EXTENDED REQUEST/RESPONSE - {func_names.get(base_func_code, "Unknown")}')
                 self.log_message(f'   Address: {addr} (32-bit), Value: {value} (0x{value:04X})')
@@ -859,7 +917,9 @@ class ModbusRTUTool(QMainWindow):
                 addr_high = struct.unpack('>H', data[2:4])[0]
                 addr_low = struct.unpack('>H', data[4:6])[0]
                 value = struct.unpack('>H', data[6:8])[0]
-                
+                if base_func_code == 6:  # Register value is payload data
+                    value = self.swap_if_lsb(value)
+
                 if addr_high > 0:
                     full_addr = (addr_high << 16) | addr_low
                     func_names = {5: 'Write Single Coil', 6: 'Write Single Register'}
@@ -870,6 +930,8 @@ class ModbusRTUTool(QMainWindow):
             elif len(data) == 6:  # Standard format
                 addr = struct.unpack('>H', data[2:4])[0]
                 value = struct.unpack('>H', data[4:6])[0]
+                if base_func_code == 6:  # Register value is payload data
+                    value = self.swap_if_lsb(value)
                 func_names = {5: 'Write Single Coil', 6: 'Write Single Register'}
                 self.log_message(f'   Type: REQUEST/RESPONSE - {func_names.get(base_func_code, "Unknown")}')
                 self.log_message(f'   Address: {addr}, Value: {value} (0x{value:04X})')
@@ -891,11 +953,7 @@ class ModbusRTUTool(QMainWindow):
                 
                 if base_func_code == 16 and byte_count > 0:  # Registers
                     write_data = data[9:9+byte_count]
-                    registers = []
-                    for i in range(0, len(write_data), 2):
-                        if i+1 < len(write_data):
-                            reg = struct.unpack('>H', write_data[i:i+2])[0]
-                            registers.append(reg)
+                    registers = self.unpack_words(write_data)
                     formatted_regs = self.format_decoded_values(registers, 'register')
                     self.log_message(f'   Values: {formatted_regs}')
             elif len(data) > 6:  # Has data field (potential request)
@@ -927,11 +985,7 @@ class ModbusRTUTool(QMainWindow):
                     
                     if base_func_code == 16:
                         write_data = data[7:7+byte_count_std]
-                        registers = []
-                        for i in range(0, len(write_data), 2):
-                            if i+1 < len(write_data):
-                                reg = struct.unpack('>H', write_data[i:i+2])[0]
-                                registers.append(reg)
+                        registers = self.unpack_words(write_data)
                         formatted_regs = self.format_decoded_values(registers, 'register')
                         self.log_message(f'   Values: {formatted_regs}')
                 else:
@@ -961,11 +1015,7 @@ class ModbusRTUTool(QMainWindow):
                             
                             if base_func_code == 16 and byte_count_split > 0:
                                 write_data = data[9:9+byte_count_split]
-                                registers = []
-                                for i in range(0, len(write_data), 2):
-                                    if i+1 < len(write_data):
-                                        reg = struct.unpack('>H', write_data[i:i+2])[0]
-                                        registers.append(reg)
+                                registers = self.unpack_words(write_data)
                                 formatted_regs = self.format_decoded_values(registers, 'register')
                                 self.log_message(f'   Values: {formatted_regs}')
                         else:
@@ -1001,11 +1051,13 @@ class ModbusRTUTool(QMainWindow):
         # Enable/disable custom packet field
         if 'Custom' in func_text:
             self.custom_packet.setEnabled(True)
+            self.auto_crc_check.setEnabled(True)
             self.start_addr.setEnabled(False)
             self.quantity.setEnabled(False)
             self.write_values.setEnabled(False)
         else:
             self.custom_packet.setEnabled(False)
+            self.auto_crc_check.setEnabled(False)
             self.start_addr.setEnabled(True)
             self.quantity.setEnabled(True)
             
@@ -1198,15 +1250,31 @@ class ModbusRTUTool(QMainWindow):
     
     def calculate_crc(self, data):
         """Calculate Modbus CRC16"""
-        crc = 0xFFFF
-        for byte in data:
-            crc ^= byte
-            for _ in range(8):
-                if crc & 0x0001:
-                    crc = (crc >> 1) ^ 0xA001
-                else:
-                    crc >>= 1
-        return struct.pack('<H', crc)  # Little-endian
+        return calculate_crc16(data)
+
+    def word_format(self):
+        """struct format for 16-bit payload data words, per byte order selection
+
+        Only register data is affected - addresses, quantities and byte counts
+        are always big-endian as required by the Modbus spec.
+        """
+        return '<H' if self.byte_order_combo.currentIndex() == 1 else '>H'
+
+    def pack_word(self, value):
+        """Pack a 16-bit payload value using the selected byte order"""
+        return struct.pack(self.word_format(), value & 0xFFFF)
+
+    def unpack_words(self, data):
+        """Unpack payload bytes into 16-bit values using the selected byte order"""
+        fmt = self.word_format()
+        return [struct.unpack(fmt, data[i:i+2])[0]
+                for i in range(0, len(data) - 1, 2)]
+
+    def swap_if_lsb(self, value):
+        """Re-interpret an already big-endian decoded word under the selected byte order"""
+        if self.byte_order_combo.currentIndex() == 1:
+            return ((value & 0xFF) << 8) | ((value >> 8) & 0xFF)
+        return value
     
     def build_mbap_header(self, pdu_length):
         """Build Modbus TCP MBAP Header
@@ -1320,14 +1388,14 @@ class ModbusRTUTool(QMainWindow):
                     addr_low = start & 0xFFFF
                     packet.extend(struct.pack('>H', addr_high))
                     packet.extend(struct.pack('>H', addr_low))
-                    packet.extend(struct.pack('>H', value & 0xFFFF))
+                    packet.extend(self.pack_word(value))
                 elif addr_mode == 2:  # Function code offset
                     packet[-1] = func_code + 0x40
                     packet.extend(struct.pack('>I', start))
-                    packet.extend(struct.pack('>H', value & 0xFFFF))
+                    packet.extend(self.pack_word(value))
             else:
                 packet.extend(struct.pack('>H', start))
-                packet.extend(struct.pack('>H', value & 0xFFFF))
+                packet.extend(self.pack_word(value))
             
         elif func_code == 15:  # Write multiple coils
             quantity = self.quantity.value()
@@ -1390,20 +1458,20 @@ class ModbusRTUTool(QMainWindow):
                     packet.extend(struct.pack('>H', quantity))
                     packet.append(byte_count)
                     for val in values:
-                        packet.extend(struct.pack('>H', val & 0xFFFF))
+                        packet.extend(self.pack_word(val))
                 elif addr_mode == 2:  # Function code offset
                     packet[-1] = func_code + 0x40
                     packet.extend(struct.pack('>I', start))
                     packet.extend(struct.pack('>H', quantity))
                     packet.append(byte_count)
                     for val in values:
-                        packet.extend(struct.pack('>H', val & 0xFFFF))
+                        packet.extend(self.pack_word(val))
             else:
                 packet.extend(struct.pack('>H', start))
                 packet.extend(struct.pack('>H', quantity))
                 packet.append(byte_count)
                 for val in values:
-                    packet.extend(struct.pack('>H', val & 0xFFFF))
+                    packet.extend(self.pack_word(val))
         
         return bytes(packet)
     
@@ -1429,12 +1497,17 @@ class ModbusRTUTool(QMainWindow):
         try:
             # Build packet (PDU for TCP, full packet with slave ID for RTU)
             packet = self.build_packet()
-            
+            is_custom = 'Custom' in self.function_combo.currentText()
+
             if self.mode == 'RTU':
-                # RTU mode: Add CRC
-                crc = self.calculate_crc(packet)
-                full_packet = packet + crc
-                
+                # RTU mode: Add CRC unless the user supplies it in a custom packet
+                if is_custom and not self.auto_crc_check.isChecked():
+                    full_packet = packet
+                    self.log_message('Auto-CRC disabled - sending custom packet exactly as entered')
+                else:
+                    crc = self.calculate_crc(packet)
+                    full_packet = packet + crc
+
                 # Clear receive buffer
                 self.serial_port.reset_input_buffer()
                 
@@ -1471,7 +1544,11 @@ class ModbusRTUTool(QMainWindow):
                 
                 if response:
                     # Check for concatenated packets and filter for our slave ID
-                    target_slave = self.slave_id.value()
+                    # (a custom packet carries its own slave ID in byte 0)
+                    if is_custom and len(full_packet) > 0:
+                        target_slave = full_packet[0]
+                    else:
+                        target_slave = self.slave_id.value()
                     packets = self.split_concatenated_packets(bytes(response))
                     
                     # Find response from our target slave
@@ -1623,17 +1700,17 @@ class ModbusRTUTool(QMainWindow):
         elif func in [3, 4]:  # Read holding/input registers
             byte_count = pdu[1]
             data = pdu[2:2+byte_count]
-            registers = []
-            for i in range(0, len(data), 2):
-                reg_value = struct.unpack('>H', data[i:i+2])[0]
-                registers.append(reg_value)
+            registers = self.unpack_words(data)
             formatted_regs = self.format_decoded_values(registers, 'register')
             self.log_message(f'  Registers: {formatted_regs}')
             
         elif func in [5, 6, 15, 16]:  # Write confirmation
             addr = struct.unpack('>H', pdu[1:3])[0]
             value = struct.unpack('>H', pdu[3:5])[0]
-            self.log_message(f'  Write confirmed - Address: {addr}, Value: {value}')
+            if func == 6:  # Echoed register value is payload data
+                value = self.swap_if_lsb(value)
+            label = 'Value' if func in [5, 6] else 'Quantity'
+            self.log_message(f'  Write confirmed - Address: {addr}, {label}: {value}')
     
     def log_message(self, message):
         """Add a message to the log display"""
